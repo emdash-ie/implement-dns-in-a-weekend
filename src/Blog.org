@@ -206,3 +206,177 @@ I’d like to get the publish date from the git commit that finishes the blog po
 * Edit history
 
 I’d like to be able to get the edit history from git, both for listing edit dates and summaries and maybe for including past versions of posts in the site.
+
+* Slick
+
+I’ve changed my mind, and would like to use [[https://github.com/ChrisPenner/slick][Slick]] to make the site. Org-publish will require some programming to get what I want out of it (as will Slick, and each other option I’ve looked at) – I’d rather do that programming in Haskell than emacs lisp.
+
+#+begin_src haskell :tangle Main.hs
+  {-# LANGUAGE BlockArguments #-}
+  {-# LANGUAGE DeriveAnyClass #-}
+  {-# LANGUAGE DeriveGeneric #-}
+  {-# LANGUAGE DuplicateRecordFields #-}
+  {-# LANGUAGE ImportQualifiedPost #-}
+  {-# LANGUAGE OverloadedStrings #-}
+  {-# LANGUAGE NamedFieldPuns #-}
+  {-# LANGUAGE RecordWildCards #-}
+
+  import Control.Lens as Lens
+  import Control.Monad
+  import Data.Aeson.Lens
+  import Data.Aeson
+  import Data.Binary
+  import Data.HashMap.Strict
+  import Data.Maybe
+  import Data.Text (Text)
+  import Data.Text qualified as Text
+  import Data.Text.IO qualified as Text
+  import Data.Vector qualified as Vector
+  import Debug.Trace
+  import Development.Shake hiding ((~>))
+  import Development.Shake.Forward
+  import Development.Shake.FilePath
+  import GHC.Generics
+  import Slick
+  import Text.Mustache as Mustache
+
+  data RawPost = RawPost
+    { title :: Text
+    , content :: Text
+    , posttags :: Maybe Text
+    } deriving (Generic, Eq, Ord, Show, FromJSON, ToJSON, Binary)
+
+  data ProcessedPost = ProcessedPost
+    { title :: Text
+    , content :: Text
+    , tags :: [Tag]
+    } deriving (Generic, Eq, Ord, Show, FromJSON, ToJSON, Binary)
+
+  instance ToMustache ProcessedPost where
+    toMustache ProcessedPost{..} = Mustache.object
+      [ "title" ~> title
+      , "content" ~> content
+      , "tags" ~= tags
+      ]
+
+  newtype Tag = Tag { tag :: Text }
+    deriving (Generic, Eq, Ord, Show, FromJSON, ToJSON, Binary)
+
+  buildPosts :: Action [ProcessedPost]
+  buildPosts = do
+    paths <- getDirectoryFiles "." ["Posts//*.org"]
+    forP paths buildPost
+
+  buildPost :: FilePath -> Action ProcessedPost
+  buildPost path = cacheAction ("build" :: Text, path) do
+    liftIO (putStrLn ("Rebuilding post: " <> path))
+    rawContent <- readFile' path
+    RawPost {title, content, posttags} <- orgModeToHTML' (Text.pack (rawContent))
+    let post = ProcessedPost
+                { title
+                , content
+                , tags = maybe [] (fmap Tag . Text.splitOn ", ") posttags
+                }
+    template <- compileTemplate' "Templates/Post.html"
+    writeFile'
+      ("Output" </> makeRelative "Posts" path -<.> ".html")
+      (Text.unpack (substitute template post))
+    return post
+
+  buildRules :: Action ()
+  buildRules = buildPosts >> return ()
+
+  main :: IO ()
+  main = do
+    let shakeOptions' = forwardOptions (shakeOptions { shakeVerbosity = Chatty
+                                                     , shakeLintInside = ["."]
+                                                     })
+    shakeArgsForward shakeOptions' buildRules
+#+end_src
+
+#+begin_src haskell-cabal :tangle ../blog.cabal
+  cabal-version: 3.4
+  name: blog
+  version: 1.0.0
+
+  executable blog
+    main-is: Main.hs
+    build-depends:
+      base,
+      aeson,
+      binary,
+      containers,
+      directory,
+      extra,
+      lens,
+      lens-aeson,
+      mustache,
+      pandoc,
+      shake,
+      slick,
+      text,
+      time,
+      unordered-containers,
+      vector
+    hs-source-dirs:
+      src
+#+end_src
+
+** Nix files
+
+I’m using nix to provide the dependencies, following the approach from [[https://github.com/Gabriella439/haskell-nix/tree/main][Gabriella Gonzalez’s haskell-nix]].
+
+#+begin_src nix :tangle ../shell.nix
+  let
+    pkgs = import <nixpkgs> {};
+  in pkgs.mkShell {
+    packages = [];
+    inputsFrom = [ (import ./release.nix).blog.env ];
+  }
+#+end_src
+
+I’ve overridden the version of slick because version 1.1.2.2 was marked as broken in nixpkgs.
+
+#+begin_src nix :tangle ../release.nix
+  let
+    config = {
+      packageOverrides = pkgs: rec {
+        haskellPackages = pkgs.haskellPackages.override {
+          overrides = haskellPackagesNew: haskellPackagesOld: rec {
+            blog =
+              haskellPackagesNew.callPackage ./blog.nix {};
+
+            slick =
+              haskellPackagesNew.callPackage ./slick.nix {};
+          };
+        };
+      };
+    };
+    pkgs = import <nixpkgs> { inherit config; };
+  in
+  { blog = pkgs.haskellPackages.blog;
+  }
+#+end_src
+
+** Mustache templates
+
+Slick requires (suggests?) using Mustache templates for defining the html. At the moment I have a very basic post template which has a title, some contents, and some tags:
+
+#+begin_src web :tangle ../Templates/Post.html :mkdirp yes
+  <html>
+    <head>
+      <title>{{{title}}}</title>
+     </head>
+    <body>
+      <main>
+        <p>This post has the following tags:</p>
+        <ul>
+          {{#tags}}
+          <li>{{{tag}}}</li>
+          {{/tags}}
+        </ul>
+        {{{content}}}
+      </main>
+    </body>
+  </html>
+#+end_src
