@@ -221,13 +221,15 @@ I’ve changed my mind, and would like to use [[https://github.com/ChrisPenner/s
   {-# LANGUAGE NamedFieldPuns #-}
   {-# LANGUAGE RecordWildCards #-}
 
-  import Control.Lens as Lens
+  import Control.Lens as Lens hiding ((<.>))
   import Control.Monad
   import Data.Aeson.Lens
   import Data.Aeson
   import Data.Binary
   import Data.HashMap.Strict
+  import Data.Map as Map
   import Data.Maybe
+  import Data.Set as Set
   import Data.Text (Text)
   import Data.Text qualified as Text
   import Data.Text.IO qualified as Text
@@ -250,17 +252,22 @@ I’ve changed my mind, and would like to use [[https://github.com/ChrisPenner/s
     { title :: Text
     , content :: Text
     , tags :: [Tag]
+    , url :: FilePath
     } deriving (Generic, Eq, Ord, Show, FromJSON, ToJSON, Binary)
 
-  instance ToMustache ProcessedPost where
-    toMustache ProcessedPost{..} = Mustache.object
-      [ "title" ~> title
-      , "content" ~> content
-      , "tags" ~= tags
-      ]
+  data TagAndPosts = TagAndPosts
+    { tag :: Text
+    , posts :: [ProcessedPost]
+    } deriving (Generic, Eq, Ord, Show, FromJSON, ToJSON, Binary)
 
-  newtype Tag = Tag { tag :: Text }
+  data Tag = Tag { tag :: Text, url :: FilePath }
     deriving (Generic, Eq, Ord, Show, FromJSON, ToJSON, Binary)
+
+  makeTag :: Text -> Tag
+  makeTag tag = Tag
+    { tag
+    , url = "Output/tag" </> Text.unpack tag <.> "html"
+    }
 
   buildPosts :: Action [ProcessedPost]
   buildPosts = do
@@ -272,19 +279,41 @@ I’ve changed my mind, and would like to use [[https://github.com/ChrisPenner/s
     liftIO (putStrLn ("Rebuilding post: " <> path))
     rawContent <- readFile' path
     RawPost {title, content, posttags} <- orgModeToHTML' (Text.pack (rawContent))
+    let url = "Output" </> makeRelative "Posts" path -<.> ".html"
     let post = ProcessedPost
                 { title
                 , content
-                , tags = maybe [] (fmap Tag . Text.splitOn ", ") posttags
+                , tags = maybe [] (fmap makeTag . Text.splitOn ", ") posttags
+                , url
                 }
     template <- compileTemplate' "Templates/Post.html"
-    writeFile'
-      ("Output" </> makeRelative "Posts" path -<.> ".html")
-      (Text.unpack (substitute template post))
+    writeFile' url
+      (Text.unpack (substitute template (toJSON post)))
     return post
 
+  buildTagPages :: [ProcessedPost] -> Action (Map Tag (Set ProcessedPost))
+  buildTagPages posts = do
+    let
+      allTags :: Map Tag (Set ProcessedPost)
+      allTags = Map.unionsWith Set.union
+        (fmap (\post@ProcessedPost{tags} -> Map.unionsWith Set.union
+          (fmap (\tag -> Map.singleton tag (Set.singleton post)) tags))
+        posts)
+    forP (Map.toList (Map.map Set.toList allTags)) (uncurry buildTagPage)
+    return allTags
+
+  buildTagPage :: Tag -> [ProcessedPost] -> Action ()
+  buildTagPage Tag{tag, url} posts = cacheAction ("build" :: Text, tag) do
+    liftIO (putStrLn ("Rebuilding tag page: " <> Text.unpack tag))
+    template <- compileTemplate' "Templates/Tag.html"
+    writeFile' url
+      (Text.unpack (substitute template (toJSON (TagAndPosts tag posts))))
+
   buildRules :: Action ()
-  buildRules = buildPosts >> return ()
+  buildRules = do
+    posts <- buildPosts
+    buildTagPages posts
+    return ()
 
   main :: IO ()
   main = do
@@ -392,10 +421,31 @@ Slick requires (suggests?) using Mustache templates for defining the html. At th
         <p>This post has the following tags:</p>
         <ul>
           {{#tags}}
-          <li>{{{tag}}}</li>
+          <li><a href="../../{{{url}}}">{{{tag}}}</a></li>
           {{/tags}}
         </ul>
         {{{content}}}
+      </main>
+    </body>
+  </html>
+#+end_src
+
+And a tags page template:
+
+#+begin_src web :tangle ../Templates/Tag.html :mkdirp yes
+  <html>
+    <head>
+      <title>Tag: {{{tag}}}</title>
+    </head>
+    <body>
+      <main>
+        <h1>Tag: {{{tag}}}</h1>
+        <p>The following posts have this tag:</p>
+        <ul>
+          {{#posts}}
+          <li><a href="../../{{{url}}}">{{{title}}}</a></li>
+          {{/posts}}
+        </ul>
       </main>
     </body>
   </html>
